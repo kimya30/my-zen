@@ -1,0 +1,9 @@
+# Default OpenCode models for my-zen - one full model id per line.
+# Read by workflow step 11 (§4): instance <prefix>N takes model line N,
+# wrapping around a shorter list. Lines starting with # and blank lines
+# are ignored. This file wins over the OPENCODE_DEFAULT_MODELS repo
+# variable; the workflow's built-in list is the last-resort fallback.
+opencode/deepseek-v4.1-flash-free
+opencode/glm-5.3-flash-free
+opencode/mimo-v2.6-flash-free
+opencode/beam-free
