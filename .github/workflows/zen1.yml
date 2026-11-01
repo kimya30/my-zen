@@ -1,0 +1,645 @@
+# my-zen / zen1 — fresh-boot OpenCode workflow. NO 9router, NO backup.
+# Every boot starts from zero: no OpenCode state is restored from this repo
+# and nothing is synced back to it. The config is rebuilt by this step on
+# every run (§4 MCPs + default model, §4b codebase-memory extras, §4c slim
+# free preset). Sessions, indexes and caches die with the runner, by design.
+# Auth: the built-in `opencode` provider reads OPENCODE_API_KEY from the
+# serve process environment. The key is a Console service-account key,
+# stored as the repository Secret OPENCODE_API_KEY (repository Variable of
+# the same name is a fallback only — Variable values are not masked).
+# Derived from the no-9router op9 variant, itself derived from the live
+# haileen5/my-opencode syd1.yml (opc). Steps are numbered cleanly 1-14
+# (10b kept); sub-sections inside the OpenCode step keep their § numbers.
+# BEFORE DISPATCHING (Mehdi does this himself): set these repository
+# Secrets in THIS repo — MY_PAT, TAILSCALE_AUTHKEY, RUNNER_PASSWORD,
+# OPENCODE_API_KEY. Do NOT run a Remote-Op "Update" on this repo: its
+# embedded template would overwrite this file with the old 9router form.
+name: zen1
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      REPO_ORIGIN: https://github.com/kimya30/h-dashboard.git
+      WF_NAME: zen1
+      OPENCODE_MODELS: ${{ vars.OPENCODE_DEFAULT_MODELS }}
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 2. Setup OpenSSH Server & Set Runner Password
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          echo "runner:${{ secrets.RUNNER_PASSWORD }}" | sudo chpasswd
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          sudo systemctl enable ssh
+
+      - name: 3. Setup npm, PATH, and Environment Variables Persistently
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          mkdir -p ~/.npm-global
+          npm config set prefix '~/.npm-global'
+
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.profile
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          echo "export GH_TOKEN=$GH_TOKEN" >> ~/.bashrc
+          echo "export GH_TOKEN=$GH_TOKEN" >> ~/.profile
+          echo "GH_TOKEN=$GH_TOKEN" | sudo tee -a /etc/environment
+
+          echo 'export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' >> ~/.bashrc
+          echo 'export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' >> ~/.profile
+          echo 'INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' | sudo tee -a /etc/environment
+
+          # CodeGraph CLI — installed here, the first step where npm is on PATH.
+          # It indexes h-dashboard in step 10b; the /usr/local/bin symlink
+          # keeps the plain `codegraph` command available in every shell.
+          npm install -g @colbymchenry/codegraph
+          if [ -x ~/.npm-global/bin/codegraph ]; then
+            sudo ln -sf ~/.npm-global/bin/codegraph /usr/local/bin/codegraph
+            echo "✅ CodeGraph installed: $(/usr/local/bin/codegraph --version)"
+          else
+            echo '⚠️ CodeGraph binary not found after installation'
+          fi
+
+      - name: 4. Install PHP 8.5 & Composer (Laravel + pgsql + redis)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lsb-release ca-certificates curl
+          # PHP now comes straight from packages.sury.org (official install
+          # per its README): the Launchpad mirror (ppa:ondrej/php) answered
+          # 503 for over an hour on 2026-10-16 and killed every run in this
+          # step, and the PPA itself announces it is merging into sury.org.
+          # The keyring package installs the repo signing key.
+          sudo curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+          sudo dpkg -i /tmp/debsuryorg-archive-keyring.deb
+          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list'
+          php_ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+              php8.5 php8.5-cli php8.5-common php8.5-fpm \
+              php8.5-mbstring php8.5-xml php8.5-pgsql php8.5-curl php8.5-zip php8.5-bcmath php8.5-intl php8.5-gd \
+              php8.5-redis php8.5-tokenizer php8.5-fileinfo php8.5-ctype \
+              unzip; then
+              php_ok=1
+              break
+            fi
+            echo "⚠️ PHP install attempt $attempt failed — retrying in 20s"
+            sleep 20
+          done
+          if [ "$php_ok" != 1 ]; then
+            echo '❌ PHP install failed after 3 attempts (packages.sury.org unreachable)'
+            exit 1
+          fi
+          php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+          sudo php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+          php -r "unlink('composer-setup.php');"
+
+      - name: 5. Connect Tailscale as Exit Node & Show Access Info
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="${{ env.WF_NAME }}" --advertise-exit-node --accept-routes --accept-dns
+
+          # Enable IP forwarding (required for exit node to route traffic)
+          echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p /etc/sysctl.conf
+
+          TS_IP=$(sudo tailscale ip -4)
+          echo "=================================================="
+          echo "  >>> SSH & WEB SERVER ARE LIVE! <<<"
+          echo "  Tailscale IP  : $TS_IP"
+          echo "  Username      : runner"
+          echo "  Password      : ${{ secrets.RUNNER_PASSWORD }}"
+          echo "  ------------------------------------------------"
+          echo "  💻 SSH: ssh runner@$TS_IP"
+          echo "  🌐 Web : http://$TS_IP:8000  (Laravel)"
+          echo "  🤖 OpenCode: http://$TS_IP:4096  (user: opencode, pass: RUNNER_PASSWORD)"
+          echo "  💾 Project: /home/runner/h-dashboard"
+          echo "  🌍 Exit Node: Enabled (advertise-exit-node)"
+          echo "=================================================="
+
+      - name: 6. Authenticate gh CLI & configure git credential helper
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          unset GH_TOKEN
+          echo "${{ secrets.MY_PAT }}" | gh auth login --with-token
+          gh auth setup-git
+          gh auth status
+          echo "✅ GitHub CLI authenticated as: $(gh api user -q .login)"
+
+      - name: 7. Clone / sync h-dashboard and create branch
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          cd /home/runner
+          if [ ! -d h-dashboard ]; then
+            git clone "$REPO_ORIGIN"
+          fi
+          cd h-dashboard
+
+          # Set git identity for commits
+          git config user.name "kimya30"
+          git config user.email "kimya30@users.noreply.github.com"
+
+          # Fetch latest origin/beta
+          git fetch origin beta
+
+          # Sync the fork's beta from upstream (asgarimehdi/h-dashboard)
+          # BEFORE branching: this fork's beta usually lags upstream, so
+          # branching from origin/beta alone would boot stale code. Mirror
+          # upstream/beta onto the fork, then branch from the freshly
+          # synced origin/beta. If the push to the fork fails (e.g. this
+          # token cannot push there), do NOT fail the boot and do NOT
+          # silently keep the stale beta either: warn loudly and branch
+          # from upstream/beta for this run instead.
+          UPSTREAM_REPO="https://github.com/asgarimehdi/h-dashboard.git"
+          BASE_REF="origin/beta"
+          if [ "$REPO_ORIGIN" = "$UPSTREAM_REPO" ]; then
+            echo "ℹ️ REPO_ORIGIN is upstream itself — fork beta sync skipped"
+          else
+            git remote get-url upstream >/dev/null 2>&1 \
+              || git remote add upstream "$UPSTREAM_REPO"
+            if git fetch upstream beta; then
+              git checkout -B beta upstream/beta
+              git remote set-url origin "$(printf '%s' "$REPO_ORIGIN" | sed "s#^https://#https://x-access-token:${GH_TOKEN}@#")"
+              if git push origin beta; then
+                git fetch origin beta
+                echo "✅ Fork beta synced from upstream asgarimehdi/h-dashboard"
+              else
+                echo "⚠️⚠️ WARNING: could not push the synced beta to the fork — branching from upstream/beta for this run; the fork's beta stays stale"
+                BASE_REF="upstream/beta"
+              fi
+            else
+              echo "⚠️⚠️ WARNING: could not fetch upstream beta — branching from origin/beta (possibly stale) for this run"
+            fi
+          fi
+
+          # Create / reset WF_NAME branch from the synced beta
+          git checkout -B "${WF_NAME}" "$BASE_REF"
+          echo "✅ Branch ${WF_NAME} created/reset from $BASE_REF"
+
+          cp .env.example.pgsql .env
+
+          # .hermes.md is not wanted — AGENTS.md is the authoritative instruction
+          # file. Drop it from the checkout and from the index (without touching
+          # beta), then exclude it so `git status` stays clean.
+          if git ls-files --error-unmatch .hermes.md >/dev/null 2>&1; then
+            git rm -q --cached .hermes.md
+          fi
+          rm -f .hermes.md
+          grep -qxF '.hermes.md' .git/info/exclude 2>/dev/null \
+            || echo '.hermes.md' >> .git/info/exclude
+          echo '✅ .hermes.md removed from the checkout and the index'
+
+      - name: 8. Start Docker Compose (PostgreSQL)
+        run: |
+          cd /home/runner/h-dashboard
+          docker compose -f docker-compose-pgsql-.yml up -d
+          echo '✅ Docker Compose started'
+
+      - name: 9. Composer, NPM, Optimize, Migrate & Seed
+        run: |
+          cd /home/runner/h-dashboard
+          composer update --no-interaction
+          npm update
+          # APP_KEY: step 7 re-copies the tracked .env template over .env on every
+          # run, and that template ships APP_KEY blank since #953 — without a key
+          # the served app throws a 500 on every web request. Generate one for
+          # this run when .env has none (artisan setup passes without it, which
+          # is why setup looked healthy while the pages failed).
+          if ! grep -q '^APP_KEY=base64:' .env; then
+            php artisan key:generate --force
+            echo '🔑 APP_KEY generated for this run'
+          fi
+          php artisan optimize:clear
+          php artisan optimize
+          php artisan migrate:fresh --seed --force
+          echo '✅ Database migrated and seeded'
+
+      - name: 10. Build frontend assets
+        run: |
+          cd /home/runner/h-dashboard
+          if ! npm run build; then
+            # npm's optional-dependencies bug (npm/cli#4828): after the
+            # `npm update` in step 9, the platform binding
+            # @rolldown/binding-linux-x64-gnu can be missing from
+            # node_modules and vite dies with "Cannot find native
+            # binding" (run 37746307765 — the identical build had passed
+            # 20 minutes earlier; the bug strikes nondeterministically).
+            # npm's own prescribed remedy is a clean reinstall without
+            # the stale lockfile; do exactly that, once, and rebuild.
+            echo '⚠️ Build failed — clean npm reinstall (stale-lock optional-deps bug), then rebuild'
+            rm -rf node_modules package-lock.json
+            npm install
+            npm run build
+          fi
+          echo '✅ Frontend assets built'
+
+      - name: 10b. Index h-dashboard with CodeGraph
+        run: |
+          cd /home/runner/h-dashboard
+          if [ -x /usr/local/bin/codegraph ]; then
+            CODEGRAPH_TELEMETRY=0 codegraph init .
+            CODEGRAPH_TELEMETRY=0 codegraph status .
+            echo '✅ CodeGraph index built for h-dashboard'
+          else
+            echo '⚠️ CodeGraph not on PATH — skipping index'
+          fi
+
+      - name: 11. Install OpenCode V2, configure MCPs + Superpowers plugin & start serve
+        env:
+          # Auth for the built-in `opencode` provider (Console / Zen free
+          # models): models.dev lists OPENCODE_API_KEY as this provider's
+          # env var, and OpenCode resolves it at request time — no
+          # `opencode auth login` and no key in any file. Secret wins;
+          # the repository Variable is only a fallback (a Variable value
+          # is NOT masked in logs and is readable via the API — prefer
+          # the Secret). Never echo this variable.
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY || vars.OPENCODE_API_KEY }}
+          OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+          OPENCODE_DISABLE_AUTOUPDATE: "true"
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          # 0. Fail FAST when no Console key is configured: without it the
+          #    serve process boots but every model call fails, and the
+          #    run then idles for the full keep-alive. The key is a
+          #    service-account key from Settings > Service accounts in
+          #    the OpenCode Console — set it as the repository Secret
+          #    OPENCODE_API_KEY (or, less safely, the Variable of the
+          #    same name). Only emptiness is checked here; the value is
+          #    never printed.
+          if [ -z "${OPENCODE_API_KEY:-}" ]; then
+            echo '❌ OPENCODE_API_KEY is empty — set the repository Secret OPENCODE_API_KEY (service-account key from the OpenCode Console) and re-run'
+            exit 1
+          fi
+          echo '✅ OPENCODE_API_KEY is set (value not shown)'
+
+          # 1. Install OpenCode V2 — npm package @opencode/cli (the v1
+          #    package opencode-ai stays on the 1.x line forever). Same
+          #    npm-global pattern as CodeGraph, plus the
+          #    /usr/local/bin symlink. Any v1 install is removed first:
+          #    both packages ship an `opencode` binary and the official
+          #    migration guide says not to keep them side by side.
+          npm uninstall -g opencode-ai >/dev/null 2>&1 || true
+          npm install -g @opencode/cli
+          if [ -f ~/.npm-global/bin/opencode ]; then
+            sudo ln -sf ~/.npm-global/bin/opencode /usr/local/bin/opencode
+            echo "✅ OpenCode installed: $(opencode --version)"
+          else
+            echo '⚠️ opencode binary not found after installation'
+          fi
+
+          # 1b. Install codebase-memory-mcp (single static binary from its
+          #     GitHub releases): the fifth MCP server, ensured in §4. Its
+          #     own OpenCode extras (skill, agents, plugin, instructions)
+          #     are installed in §4b, and its index cache
+          #     (its index cache starts empty on every fresh boot — no
+          #     restore, no sync-back).
+          #     The binary MUST live in a user-owned dir
+          #     ($HOME/.local/bin, no sudo): the `install -y` in §4b
+          #     runs an activation transaction that refuses to
+          #     proceed when the binary's install dir is root-owned
+          #     ("install_dir_not_owned_by_you") — with the old
+          #     root-owned /usr/local/bin copy, §4b silently wrote
+          #     NOTHING for the whole lifetime of these workflows.
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -x "$HOME/.local/bin/codebase-memory-mcp" ]; then
+            CBM_TMP="$(mktemp -d)"
+            curl -fsSL -o "$CBM_TMP/cbm.tar.gz" https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-linux-amd64.tar.gz
+            tar --no-same-owner -xzf "$CBM_TMP/cbm.tar.gz" -C "$CBM_TMP"
+            install -m 0755 "$CBM_TMP/codebase-memory-mcp" "$HOME/.local/bin/codebase-memory-mcp"
+            rm -rf "$CBM_TMP"
+            echo "✅ codebase-memory-mcp installed: $("$HOME/.local/bin/codebase-memory-mcp" --version)"
+          fi
+
+          # 2. FRESH BOOT — nothing is restored. There is no
+          #    opencode/ backup in this repo by design: every run
+          #    rebuilds ~/.config/opencode from scratch in §4/§4b/§4c
+          #    below, sessions start empty, and the codebase-memory
+          #    index cache starts empty. (The only repo-side config
+          #    read is opencode/default-models.txt, in §4.)
+
+          # 3. Prepare the MCP environment. OpenCode does NOT inherit gh's
+          #    login: every MCP server is a separate process that reads only
+          #    its own env vars. So the GitHub token (same MY_PAT gh uses)
+          #    is exported here — opencode serve below inherits it, and
+          #    the config in §4 references it as
+          #    {env:...}, so NO secret lands in opencode.json (which is never
+          #    committed anywhere — this repo keeps no backup). Persisted to ~/.bashrc as well, for
+          #    shells opened later over SSH.
+          export GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN"
+          echo "export GITHUB_PERSONAL_ACCESS_TOKEN=${GH_TOKEN}" >> ~/.bashrc
+          echo '✅ MCP environment prepared (GitHub token exported for opencode serve)'
+
+          # 3b. The laravel-boost MCP runs `php artisan boost:mcp` inside
+          #     h-dashboard; the package used to be composer-required by the
+          #     old Hermes step, so ensure it here (no-op if already there).
+          cd /home/runner/h-dashboard
+          if php artisan list 2>/dev/null | grep -q 'boost:mcp'; then
+            echo '✅ Laravel Boost present (boost:mcp available)'
+          else
+            composer require laravel/boost --no-interaction 2>&1 | tail -3 || true
+            php artisan boost:update 2>/dev/null || true
+            echo '✅ Laravel Boost installed for the laravel-boost MCP'
+          fi
+
+          # 4. Write/merge ~/.config/opencode/opencode.json. OpenCode reads
+          #    MCP servers ONLY from its own config. The merge ENSURES the
+          #    wanted servers (laravel-boost, github, codegraph, context7,
+          #    codebase-memory-mcp), DROPS postgis for good (removed at
+          #    Mehdi's request), and
+          #    PRESERVES any other server already in the config — servers
+          #    the mcp block is merged, never rewritten whole, so the step
+          #    stays idempotent if a config is ever pre-seeded.
+          #    It also ensures the Superpowers plugin: V2 reads the
+          #    `plugins` array; the V1 `plugin` key is mirrored with the
+          #    same spec so a rollback to V1 would keep the plugin too.
+          #    oh-my-opencode-slim is ensured in the `plugins` array
+          #    ONLY: it is a dual-export plugin, and its own
+          #    v2-compatibility doc warns that a legacy `plugin`-key
+          #    entry gets invoked twice on v2 hosts. Its per-agent
+          #    free models are configured in §4c.
+          python3 - <<'PYEOF2'
+          import json, os
+          path = os.path.expanduser("~/.config/opencode/opencode.json")
+          cfg = {}
+          if os.path.exists(path):
+              try:
+                  cfg = json.load(open(path))
+              except Exception:
+                  cfg = {}
+          cfg.setdefault("$schema", "https://opencode.ai/config.json")
+          # Auth note: NO provider block is written for `opencode`. The
+          # built-in provider already points at the Console inference
+          # endpoint and reads OPENCODE_API_KEY from the serve
+          # process environment (models.dev: env OPENCODE_API_KEY,
+          # api https://opencode.ai/inference/openai/v1). Writing a
+          # V1-style provider.options.apiKey block would be ignored
+          # at best on V2, and a literal key here would land in the
+          # config file. Only sanitize: drop a stale
+          # baseURL that points at the removed local 9router proxy,
+          # so a stale config can never route models to a
+          # port nothing listens on any more.
+          for _pkey in ("provider", "providers"):
+              _prov = cfg.get(_pkey, {})
+              if isinstance(_prov, dict):
+                  _oc = _prov.get("opencode")
+                  if isinstance(_oc, dict):
+                      _opts = _oc.get("options", _oc.get("settings", {}))
+                      if isinstance(_opts, dict):
+                          _bu = str(_opts.get("baseURL", _opts.get("base_url", "")))
+                          if "20128" in _bu or "9router" in _bu or "127.0.0.1" in _bu or "localhost" in _bu:
+                              _opts.pop("baseURL", None)
+                              _opts.pop("base_url", None)
+                              print("🧹 Dropped stale 9router baseURL from opencode config")
+          # Autoupdate stays OFF: the runner is ephemeral, so an
+          # /update could never persist, and the update banner
+          # only adds noise when a release lands mid-run.
+          cfg["autoupdate"] = False
+          # The default model is PER-INSTANCE and comes from the
+          # opencode/default-models.txt file in this repo: one full
+          # model id per line (# comments and blank lines ignored).
+          # The file wins whenever it has at least one model line, so
+          # models are changed by a plain commit to that file. If the
+          # file is missing or empty, the OPENCODE_DEFAULT_MODELS
+          # repository variable (repo Settings > Secrets and variables
+          # > Actions > Variables) applies; if that is empty or unset
+          # too, the built-in list below is the last resort. Each
+          # workflow takes its own line by number (<prefix>1 -> line 1,
+          # <prefix>2 -> line 2, ...). A shorter list wraps around
+          # instead of erroring (with 2 lines: instance 3 -> line 1,
+          # instance 4 -> line 2).
+          _models = []
+          try:
+              with open(os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), "opencode/default-models.txt")) as _mf:
+                  _models = [ln.strip() for ln in _mf if ln.strip() and not ln.strip().startswith("#")]
+          except OSError:
+              _models = []
+          if not _models:
+              _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
+          if not _models:
+              _models = [
+                  "opencode/deepseek-v4.1-flash-free",
+                  "opencode/glm-5.3-flash-free",
+                  "opencode/mimo-v2.6-flash-free",
+                  "opencode/beam-free",
+              ]
+          # The instance number is the trailing digits of WF_NAME,
+          # whatever the prefix is (open3, mehdi3, fork12, ...): the
+          # model list is indexed by that number.
+          _wf = os.environ.get("WF_NAME", "")
+          _num = ""
+          for _ch in reversed(_wf):
+              if _ch.isdigit():
+                  _num = _ch + _num
+              else:
+                  break
+          _idx = int(_num) - 1 if _num else 0
+          cfg["model"] = _models[_idx % len(_models)]
+          mcp = cfg.get("mcp", {})
+          mcp.pop("postgis", None)
+          mcp.update({
+              "laravel-boost": {
+                  "type": "local",
+                  "command": ["bash", "-c", "cd /home/runner/h-dashboard && exec php artisan boost:mcp"],
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "github": {
+                  "type": "local",
+                  "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+                  "environment": {
+                      "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PERSONAL_ACCESS_TOKEN}",
+                  },
+                  "enabled": True,
+                  "timeout": 120000,
+              },
+              "codegraph": {
+                  "type": "local",
+                  "command": ["codegraph", "serve", "--mcp"],
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "context7": {
+                  "type": "remote",
+                  "url": "https://mcp.context7.com/mcp",
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "codebase-memory-mcp": {
+                  "type": "local",
+                  "command": [os.path.expanduser("~/.local/bin/codebase-memory-mcp")],
+                  "enabled": True,
+                  "timeout": 60000,
+              },
+          })
+          cfg["mcp"] = mcp
+          sp_spec = "superpowers@git+https://github.com/obra/superpowers.git"
+          for pkey in ("plugins", "plugin"):
+              plist = cfg.get(pkey, [])
+              if sp_spec not in plist:
+                  plist.append(sp_spec)
+              cfg[pkey] = plist
+          slim_spec = "oh-my-opencode-slim"
+          plist = cfg.get("plugins", [])
+          if slim_spec not in plist:
+              plist.append(slim_spec)
+          cfg["plugins"] = plist
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          with open(path, "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("✅ opencode.json ready: default model + mcp (laravel-boost, github, codegraph, context7, codebase-memory-mcp; postgis dropped) + superpowers & oh-my-opencode-slim plugins")
+          PYEOF2
+
+          # 4b. codebase-memory-mcp's own OpenCode integration: its skill
+          #     (~/.config/opencode/skills/codebase-memory), three read-only
+          #     agents, the cbm-augment plugin and AGENTS.md instructions.
+          #     Everything lands under ~/.config/opencode for this run
+          #     only; nothing is synced back — the next boot rebuilds it. Two installer quirks shape
+          #     this loop: (1) it aborts instantly when its binary is
+          #     root-owned ("install_dir_not_owned_by_you") — hence the
+          #     user-owned copy from §1b; with the old root-owned
+          #     /usr/local/bin copy this step silently wrote NOTHING for
+          #     the whole lifetime of these workflows, which is why the
+          #     extras never reached a backup in the old fleet design;
+          #     (2) its config-write ops
+          #     race each other and a random subset fails per run
+          #     ("target: does not exist or cannot be inspected" — root
+          #     runs mask it, mode bits do not bind root), so --force is
+          #     retried until every expected file is actually on disk.
+          #     The MCP entry itself is ensured by §4; this loop only
+          #     chases the extras.
+          CBM_EXTRAS="AGENTS.md skills/codebase-memory/SKILL.md agents/codebase-memory.md agents/codebase-memory-scout.md agents/codebase-memory-auditor.md plugins/cbm-augment.ts"
+          missing=1
+          for attempt in 1 2 3 4 5; do
+            "$HOME/.local/bin/codebase-memory-mcp" install -y --force > /tmp/cbm-install.log 2>&1 || true
+            chmod -R u+w ~/.config/opencode 2>/dev/null || true
+            missing=0
+            for f in $CBM_EXTRAS; do
+              [ -f "$HOME/.config/opencode/$f" ] || missing=1
+            done
+            [ "$missing" = 0 ] && break
+            echo "⚠️ codebase-memory-mcp extras incomplete after attempt $attempt — retrying"
+          done
+          if [ "$missing" = 0 ]; then
+            echo '✅ codebase-memory-mcp OpenCode extras installed (skill, 3 agents, plugin, AGENTS.md)'
+          else
+            echo '⚠️ codebase-memory-mcp extras still incomplete after 5 attempts — see /tmp/cbm-install.log; the MCP server itself is ensured in §4'
+          fi
+
+          # 4c. oh-my-opencode-slim: write/merge its config
+          #     (~/.config/opencode/oh-my-opencode-slim.json, rebuilt fresh
+          #     on every boot) with a "free" preset
+          #     that puts EVERY agent on a free OpenCode Zen model, plus
+          #     free councillors for the Council agent. The merge
+          #     preserves any other presets/settings already present, and
+          #     "preset" is only defaulted to "free" when unset, so a
+          #     preset later picked with /preset is not forced back.
+          #     The plugin itself is registered in §4 (plugins array).
+          #     2026-10-16 refresh against the live Zen free list:
+          #     ling-3.1-flash-free was REMOVED from Zen (the librarian
+          #     had to move), deepseek-v4.1-flash-free and
+          #     glm-5.3-flash-free are new zero-retention flash models,
+          #     and beam-free (1M, no training) is the designer —
+          #     Zen is called from the runner, so its country list
+          #     does not apply to this setup (Mehdi, 2026-10-16).
+          #     2026-10-17: beam-free is Reflection Beam, the
+          #     de-stealthed successor of cat-jam-free (deprecated,
+          #     gone from the live Zen list); same interface.
+          python3 - <<'PYEOF3'
+          import json, os
+          path = os.path.expanduser("~/.config/opencode/oh-my-opencode-slim.json")
+          cfg = {}
+          if os.path.exists(path):
+              try:
+                  cfg = json.load(open(path))
+              except Exception:
+                  cfg = {}
+          free_models = {
+              "orchestrator": "opencode/deepseek-v4.1-flash-free",
+              "oracle": "opencode/nemotron-3.5-lightning-free",
+              "explorer": "opencode/glm-5.3-flash-free",
+              "fixer": "opencode/deepseek-v4.1-flash-free",
+              "librarian": "opencode/glm-5.3-flash-free",
+              "designer": "opencode/beam-free",
+              "council": "opencode/nemotron-3.5-lightning-free",
+          }
+          free_preset = cfg.setdefault("presets", {}).setdefault("free", {})
+          for agent, model in free_models.items():
+              free_preset.setdefault(agent, {})["model"] = model
+          councillors = cfg.setdefault("council", {}).setdefault("presets", {}).setdefault("default", {})
+          # Migration for this refresh: the previously managed
+          # councillors "mimo"/"spark" are superseded by the names
+          # below; pop them so a rebuilt config keeps no stale ones.
+          for stale in ("mimo", "spark"):
+              councillors.pop(stale, None)
+          for cname, cmodel in (("deepseek", "opencode/deepseek-v4.1-flash-free"),
+                                ("nemotron", "opencode/nemotron-3.5-lightning-free"),
+                                ("glm", "opencode/glm-5.3-flash-free")):
+              councillors.setdefault(cname, {})["model"] = cmodel
+          cfg["council"].setdefault("default_preset", "default")
+          cfg.setdefault("preset", "free")
+          with open(path, "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("✅ oh-my-opencode-slim.json ready: 'free' preset — every agent on a free OpenCode Zen model")
+          PYEOF3
+
+          # 5. Start opencode serve in the background on 0.0.0.0:4096 so it
+          #    is reachable over Tailscale. HTTP Basic Auth comes from the
+          #    OPENCODE_SERVER_PASSWORD step env (= RUNNER_PASSWORD secret);
+          #    the username defaults to "opencode".
+          cd /home/runner/h-dashboard
+          nohup opencode serve --hostname 0.0.0.0 --port 4096 > /tmp/opencode.log 2>&1 &
+          sleep 6
+          if curl -fsS -u "opencode:${OPENCODE_SERVER_PASSWORD}" http://localhost:4096/api/info > /dev/null 2>&1; then
+            echo '✅ opencode serve is live on http://localhost:4096 (basic auth: opencode / RUNNER_PASSWORD)'
+          else
+            echo '⚠️ opencode serve did not come up — check /tmp/opencode.log'
+          fi
+
+          # 5b. Advisory Console smoke check: does this key authenticate
+          #     against the Inference API models endpoint? Advisory
+          #     ONLY — a non-200 here does not stop the run (the header
+          #     contract could differ by key kind), but a 200 here
+          #     proves key + endpoint before the keep-alive starts.
+          #     Only the HTTP code is printed; the key never is.
+          _smoke=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${OPENCODE_API_KEY}" https://opencode.ai/inference/openai/v1/models || echo '000')
+          if [ "$_smoke" = "200" ]; then
+            echo '✅ Console smoke check: Inference API models endpoint answered 200 with OPENCODE_API_KEY'
+          else
+            echo "⚠️ Console smoke check: Inference API models endpoint answered HTTP ${_smoke} — the web UI may still work; check the key kind/permissions in the Console if model calls fail"
+          fi
+
+      - name: 12. Start Laravel Development Server
+        run: |
+          cd /home/runner/h-dashboard
+          nohup php artisan serve --host=0.0.0.0 > /dev/null 2>&1 &
+          echo '✅ Laravel server started on port 8000'
+
+      - name: 13. Server Keep-Alive (5h 40m)
+        run: |
+          for i in {1..340}; do
+            sleep 60
+            echo "[$i/340] Server is active (SSH + Laravel :8000 + OpenCode :4096)..."
+          done
+
+      - name: 14. Tailscale Logout (cleanup on shutdown)
+        if: always()
+        run: |
+          sudo tailscale logout || true
+          echo "✅ Tailscale logout executed — hostname freed"
